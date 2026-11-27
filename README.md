@@ -18,14 +18,14 @@ To use these templates, you can reference them in your Gemini API calls or use t
 
 ## Static site and GitHub Actions
 
-The static catalog is built from the template `agent.yaml` files and deployed to [GitHub Pages](https://khanhlegood3.github.io/gemini-managed-agents-templates/) on pushes to `main`. Pull requests build and test the site without deploying. In repository settings, set **Pages → Build and deployment → Source** to **GitHub Actions**. A manual Pages run deploys only when run from `main`.
+The static catalog and template detail pages are built from the template `agent.yaml` files and rendered README guides and deployed to [GitHub Pages](https://khanhlegood3.github.io/gemini-managed-agents-templates/) on pushes to `main`. Pull requests build and test the site without deploying. In repository settings, set **Pages → Build and deployment → Source** to **GitHub Actions**. A manual Pages run deploys only when run from `main`.
 
 To build locally (Python 3.9+):
 
 ```bash
 python -m venv .venv
 . .venv/bin/activate
-python -m pip install 'PyYAML==6.0.3'
+python -m pip install -r requirements-site.txt
 python scripts/build_site.py
 python -m unittest discover -s tests -v
 python -m http.server --directory _site 8000

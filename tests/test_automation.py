@@ -20,6 +20,7 @@ class StaticSiteTests(unittest.TestCase):
             (root / 'site').mkdir()
             (root / 'site' / 'index.html').write_text('<a href="<!-- REPOSITORY_URL -->">repo</a><!-- TEMPLATE_CARDS -->', encoding='utf-8')
             (root / 'site' / 'style.css').write_text('body{}', encoding='utf-8')
+            (root / 'site' / 'template.html').write_text((ROOT / 'site' / 'template.html').read_text(encoding='utf-8'), encoding='utf-8')
             agent = root / 'test-agent'
             agent.mkdir()
             (agent / 'agent.yaml').write_text('description: "<script>alert(1)</script>"\nexamples:\n  - title: "<Example>"\n    prompt: "test"\n', encoding='utf-8')
@@ -28,7 +29,14 @@ class StaticSiteTests(unittest.TestCase):
             page = (root / '_site' / 'index.html').read_text(encoding='utf-8')
             self.assertIn('&lt;script&gt;', page)
             self.assertIn('&lt;Example&gt;', page)
-            self.assertIn('https://github.com/owner/repo/tree/main/test-agent/agent.yaml', page)
+            self.assertIn('href="templates/test-agent/"', page)
+            detail = (root / '_site' / 'templates' / 'test-agent' / 'index.html').read_text(encoding='utf-8')
+            self.assertIn('&lt;script&gt;', detail)
+            self.assertIn('&lt;Example&gt;', detail)
+            self.assertIn('https://github.com/owner/repo/tree/main/test-agent', detail)
+            self.assertIn('does not include a README', detail)
+            self.assertIn('href="../../style.css"', detail)
+            self.assertIn('href="../../#templates"', detail)
             self.assertNotIn('<script>', page)
             self.assertTrue((root / '_site' / 'style.css').is_file())
 
@@ -38,6 +46,28 @@ class StaticSiteTests(unittest.TestCase):
         self.assertEqual(page.count('<article class="card">'), len(list(ROOT.glob('*/agent.yaml'))))
         self.assertIn('href="style.css"', page)
         self.assertNotIn('<!-- TEMPLATE_CARDS -->', page)
+        for agent in ROOT.glob('*/agent.yaml'):
+            self.assertIn(f'href="templates/{agent.parent.name}/"', page)
+            detail = (ROOT / '_site' / 'templates' / agent.parent.name / 'index.html').read_text(encoding='utf-8')
+            config = build_site.yaml.safe_load(agent.read_text(encoding='utf-8'))
+            for example in config.get('examples', []):
+                self.assertIn(build_site.escape(example['title']), detail)
+                self.assertIn(build_site.escape(example['prompt']), detail)
+            if (agent.parent / 'README.md').is_file():
+                self.assertIn('class="documentation"><h1', detail)
+
+    def test_render_markdown_safely_and_resolve_links(self):
+        rendered = build_site.render_readme(
+            '# Heading\n\n**Bold** [file](guide.md) [section](#heading) [bad](javascript:alert(1))\n\n<script>alert(1)</script>\n\n```bash\necho hello\n```',
+            'https://github.com/owner/repo/blob/main/agent/',
+        )
+        self.assertIn('<h1 id="heading">Heading</h1>', rendered)
+        self.assertIn('<strong>Bold</strong>', rendered)
+        self.assertIn('href="https://github.com/owner/repo/blob/main/agent/guide.md"', rendered)
+        self.assertIn('href="#heading"', rendered)
+        self.assertNotIn('href="javascript:', rendered)
+        self.assertNotIn('<script>', rendered)
+        self.assertIn('<pre><code', rendered)
 
 
 class ProbeTests(unittest.TestCase):
