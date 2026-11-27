@@ -16,6 +16,23 @@ This repository contains a collection of templates for building and deploying Ge
 
 To use these templates, you can reference them in your Gemini API calls or use the Gemini API CLI to scaffold new agents based on these templates.
 
+## Static site and GitHub Actions
+
+The static catalog is built from the template `agent.yaml` files and deployed to [GitHub Pages](https://khanhlegood3.github.io/gemini-managed-agents-templates/) on pushes to `main`. Pull requests build and test the site without deploying. In repository settings, set **Pages → Build and deployment → Source** to **GitHub Actions**. A manual Pages run deploys only when run from `main`.
+
+To build locally (Python 3.9+):
+
+```bash
+python -m venv .venv
+. .venv/bin/activate
+python -m pip install 'PyYAML==6.0.3'
+python scripts/build_site.py
+python -m unittest discover -s tests -v
+python -m http.server --directory _site 8000
+```
+
+The nightly workflow validates templates and payload generation on pull requests without accessing secrets or making API calls. Scheduled and manually triggered live probes require the `GEMINI_API_KEY` repository Actions secret. Live probes can incur API usage and require access to the configured agent and Gemini Interactions API. If the key is missing, the workflow fails once during setup with instructions instead of creating one failure per prompt. Probe issues are managed only when repository Issues are enabled; the Actions token must have permission to write issues. Failed probes are retried three times; pending issues are promoted after a subsequent failure at least two hours later.
+
 ## Running Probers
 
 Each template directory contains a `probers.sh` script that can be used to test the agent template by sending a "Hello" prompt to the Gemini API. These probers read the template information (like `AGENTS.md` and skills) dynamically from disk.
