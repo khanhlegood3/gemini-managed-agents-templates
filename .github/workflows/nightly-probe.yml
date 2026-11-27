@@ -2,9 +2,9 @@ name: Nightly Template Probe
 
 on:
   schedule:
-    - cron: '0 2 * * *'  # Nightly at 2am
-  workflow_dispatch:      # Allow manual trigger
-  pull_request:          # Allow testing on PRs
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+  pull_request:
 
 permissions:
   contents: read
@@ -12,79 +12,52 @@ permissions:
 jobs:
   setup:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
-      - name: Check out repository
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-
-      - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
-
-      - name: Install PyYAML
-        run: pip install pyyaml
-
-      - name: Generate Matrix
-        id: set-matrix
+      - run: python -m pip install 'PyYAML==6.0.3'
+      - name: Validate templates and generate matrix
+        id: matrix
+        run: python scripts/probe_matrix.py
+      - name: Check API key
+        if: github.event_name != 'pull_request'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
-          # Build a matrix entry for each chip in each template
-          python3 -c "
-          import json, yaml, os, glob
-
-          matrix = []
-          for agent_file in sorted(glob.glob('*/agent.yaml')):
-              template = os.path.dirname(agent_file)
-              with open(agent_file) as f:
-                  config = yaml.safe_load(f)
-              examples = config.get('examples', [])
-              for example in examples:
-                  matrix.append({
-                      'template': template,
-                      'chip': example['title'],
-                      'prompt': example['prompt'],
-                  })
-
-          print(f'Found {len(matrix)} chip(s) across templates')
-          for entry in matrix:
-              print(f\"  {entry['template']} / {entry['chip']}\")
-
-          # Output for GitHub Actions
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write(f'matrix={json.dumps(matrix)}\n')
-          "
+          if [ -z "$GEMINI_API_KEY" ]; then
+            echo '::error::Set the GEMINI_API_KEY repository Actions secret before running live probes.'
+            exit 1
+          fi
 
   probe:
+    if: github.event_name != 'pull_request'
     needs: setup
+    name: Probe ${{ matrix.template }} / ${{ matrix.chip }}
     runs-on: ubuntu-latest
+    timeout-minutes: 35
     permissions:
-      issues: write
       contents: read
+      issues: write
     strategy:
       fail-fast: false
+      max-parallel: 5
       matrix:
-        include: ${{ fromJson(needs.setup.outputs.matrix) }}
-
+        include: ${{ fromJSON(needs.setup.outputs.matrix) }}
     steps:
-      - name: Check out repository
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-
-      - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
-
-      - name: Install Python dependencies
-        run: pip install pyyaml
-
-      - name: Run Probe
+      - run: python -m pip install 'PyYAML==6.0.3'
+      - name: Run probe
         id: run_probe
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -92,106 +65,61 @@ jobs:
           CHIP: ${{ matrix.chip }}
           PROMPT: ${{ matrix.prompt }}
         run: |
-          echo "Template: $TEMPLATE"
-          echo "Chip: $CHIP"
-          echo "Prompt: $PROMPT"
-
-          n=0
-          until [ "$n" -ge 3 ]; do
-            echo "::group::Attempt $((n+1))/3 for $TEMPLATE / $CHIP"
-
-            # Generate the payload
-            cd "$GITHUB_WORKSPACE/$TEMPLATE"
-            python3 "$GITHUB_WORKSPACE/generate_payload.py" "$PROMPT" > /tmp/probe_payload.json
-
-            # Send the request, capture HTTP status code separately
-            HTTP_CODE=$(curl -s -o /tmp/probe_response.log -w "%{http_code}" \
-              -X POST "https://generativelanguage.googleapis.com/v1beta/interactions" \
-              -H "Content-Type: application/json" \
+          cd "$GITHUB_WORKSPACE/$TEMPLATE"
+          python "$GITHUB_WORKSPACE/generate_payload.py" "$PROMPT" > "$RUNNER_TEMP/probe_payload.json"
+          for attempt in 1 2 3; do
+            echo "Attempt $attempt/3 for $TEMPLATE / $CHIP"
+            # curl can fail before receiving an HTTP status; do not let errexit skip retries.
+            if HTTP_CODE=$(curl -sS -o "$RUNNER_TEMP/probe_response.log" -w '%{http_code}' \
+              -X POST 'https://generativelanguage.googleapis.com/v1beta/interactions' \
+              -H 'Content-Type: application/json' \
+              -H 'Accept: text/event-stream' \
+              -H 'Api-Revision: 2026-05-20' \
               -H "x-goog-api-key: $GEMINI_API_KEY" \
-              -H "x-server-timeout: 600" \
-              --max-time 660 \
-              -d @/tmp/probe_payload.json)
-
-            echo "HTTP status: $HTTP_CODE"
-
-            # Check for success: HTTP 200 and response body is non-empty
-            RESPONSE_SIZE=$(wc -c < /tmp/probe_response.log | tr -d ' ')
-
-            if [ "$HTTP_CODE" = "200" ] && [ "$RESPONSE_SIZE" -gt 0 ]; then
-              # Check response doesn't contain top-level error
-              if ! grep -q '"error"' /tmp/probe_response.log 2>/dev/null; then
-                echo "Probe succeeded."
-                echo "::endgroup::"
-                break
-              else
-                echo "Response contained error:"
-                head -c 500 /tmp/probe_response.log
+              -H 'x-server-timeout: 600' --max-time 660 \
+              -d @"$RUNNER_TEMP/probe_payload.json"); then
+              echo "HTTP status: $HTTP_CODE"
+              if [ "$HTTP_CODE" = 200 ] && python "$GITHUB_WORKSPACE/scripts/probe_response.py" "$RUNNER_TEMP/probe_response.log"; then
+                echo 'Probe succeeded.'
+                exit 0
               fi
             else
-              echo "Probe failed (HTTP $HTTP_CODE, response size: $RESPONSE_SIZE bytes)"
-              head -c 500 /tmp/probe_response.log
+              echo 'Request failed before a response was received.'
             fi
-
-            echo "::endgroup::"
-            n=$((n+1))
-            if [ "$n" -lt 3 ]; then
-              echo "Retrying in 10 seconds... (Attempt $((n+1))/3)"
-              sleep 10
-            fi
+            if [ "$attempt" -lt 3 ]; then sleep 10; fi
           done
-
-          if [ "$n" -ge 3 ]; then
-            echo "Probe failed after 3 attempts."
-            exit 1
-          fi
-
-      - name: Manage Issues
-        if: always() && github.event_name != 'pull_request'
+          echo '::error::Probe failed after three attempts. Check API access and response status.'
+          exit 1
+      - name: Manage probe issue
+        if: ${{ !cancelled() && github.event.repository.has_issues && (steps.run_probe.outcome == 'success' || steps.run_probe.outcome == 'failure') }}
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           TEMPLATE: ${{ matrix.template }}
           CHIP: ${{ matrix.chip }}
           STATUS: ${{ steps.run_probe.outcome }}
         run: |
-          ISSUE_TAG="$TEMPLATE / $CHIP"
-          ISSUE=$(gh issue list --state open --json number,title -q ".[] | select(.title | contains(\"$ISSUE_TAG\")) | .number")
-
-          if [ "$STATUS" = "success" ]; then
-            if [ -n "$ISSUE" ]; then
-              echo "Probe succeeded. Closing issue #$ISSUE."
-              gh issue close "$ISSUE" --comment "Probe succeeded in run $GITHUB_RUN_ID. Closing issue."
-            else
-              echo "Probe succeeded and no open issue found."
+          tag="$TEMPLATE / $CHIP"
+          pending="[Pending] Probe Failed: $tag"
+          active="Probe Failed: $tag"
+          issue=$(gh issue list --state open --limit 1000 --json number,title | jq -r --arg pending "$pending" --arg active "$active" '.[] | select(.title == $pending or .title == $active) | .number')
+          if [ "$STATUS" = success ]; then
+            if [ -n "$issue" ]; then
+              while IFS= read -r number; do
+                gh issue close "$number" --comment "Probe succeeded in run $GITHUB_RUN_ID."
+              done <<< "$issue"
             fi
+          elif [ -z "$issue" ]; then
+            gh issue create --title "$pending" --body "Probe failed for **$TEMPLATE** / **$CHIP** in run $GITHUB_RUN_ID. It will be promoted after two hours if it fails again."
           else
-            if [ -n "$ISSUE" ]; then
-              LABELS=$(gh issue view "$ISSUE" --json labels -q ".labels[].name")
-              IS_PENDING=$(echo "$LABELS" | grep -q "probe-pending" && echo "true" || echo "false")
-
-              if [ "$IS_PENDING" = "true" ]; then
-                CREATED_AT=$(gh issue view "$ISSUE" --json createdAt -q ".createdAt")
-                CREATED_SEC=$(date -d "$CREATED_AT" +%s)
-                NOW_SEC=$(date +%s)
-                AGE_MIN=$(( (NOW_SEC - CREATED_SEC) / 60 ))
-
-                if [ "$AGE_MIN" -gt 90 ]; then
-                  echo "Pending issue #$ISSUE is older than 90 minutes ($AGE_MIN mins). Promoting to active."
-                  gh issue edit "$ISSUE" --title "Probe Failed: $ISSUE_TAG" --remove-label "probe-pending" --add-label "probe-failing"
-                  gh issue comment "$ISSUE" --body "Probe failed again after 2 hours. Promoting to active issue."
-                else
-                  echo "Pending issue #$ISSUE is not old enough yet ($AGE_MIN mins). Adding comment."
-                  gh issue comment "$ISSUE" --body "Probe failed again in run $GITHUB_RUN_ID. Still pending escalation."
+            while IFS= read -r number; do
+              title=$(gh issue view "$number" --json title --jq .title)
+              if [ "$title" = "$pending" ]; then
+                created=$(gh issue view "$number" --json createdAt --jq .createdAt)
+                age=$(( $(date +%s) - $(date -d "$created" +%s) ))
+                if [ "$age" -ge 7200 ]; then
+                  gh issue edit "$number" --title "$active"
                 fi
-              else
-                echo "Active issue #$ISSUE found. Adding comment."
-                gh issue comment "$ISSUE" --body "Probe failed again in run $GITHUB_RUN_ID."
               fi
-            else
-              echo "No issue found. Creating pending issue."
-              gh issue create \
-                --title "[Pending] Probe Failed: $ISSUE_TAG" \
-                --body "Probe failed for **$TEMPLATE** chip **$CHIP** in run $GITHUB_RUN_ID. Waiting 2 hours before escalation." \
-                --label "probe-pending"
-            fi
+              gh issue comment "$number" --body "Probe failed again in run $GITHUB_RUN_ID."
+            done <<< "$issue"
           fi
